@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "outDir": "dist-scripts",
+    "rootDir": ".",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "noEmit": false,
+    "baseUrl": "."
+  },
+  "include": [
+    "scripts/**/*.ts",
+    "src/bot/**/*.ts",
+    "src/lib/db.ts"        // only db.ts from lib is needed by scripts/bot
+  ]
+}
