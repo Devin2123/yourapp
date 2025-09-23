@@ -1,12 +1,26 @@
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  // If you hit a “shadow DB permission” error again, uncomment the next line and add SHADOW_DATABASE_URL in .env
+  // If you hit a shadow DB permission error, uncomment:
   // shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
 }
 
 generator client {
   provider = "prisma-client-js"
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  EXPIRED
+  CANCELED
+  FAILED
+}
+
+enum RoleGrantStatus {
+  QUEUED
+  DONE
+  FAILED
 }
 
 model Server {
@@ -18,32 +32,79 @@ model Server {
   splitterAddress String
   createdAt       DateTime  @default(now())
   products        Product[]
-  // orders Order[]  <-- remove this line
 }
 
 model Product {
   id          String   @id @default(cuid())
   serverId    String
-  server      Server   @relation(fields: [serverId], references: [id])
+  server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
   name        String
   description String?
-  priceWei    String // store big ints as strings
-  currency    String // "NATIVE" or token symbol
+  priceWei    String
+  currency    String
   chain       String   @default("POLYGON")
   roleId      String?
   active      Boolean  @default(true)
   createdAt   DateTime @default(now())
   orders      Order[]
+
+  // ⬇️ add this line
+  roleGrants RoleGrant[]
+
+  @@index([serverId])
+  @@index([active, createdAt])
 }
 
 model Order {
-  id             String   @id @default(cuid())
+  id             String      @id @default(cuid())
   productId      String
-  product        Product  @relation(fields: [productId], references: [id])
+  product        Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
   buyerDiscordId String?
-  invoiceId      String?  @unique
-  status         String   @default("PENDING") // PENDING | PAID | EXPIRED | CANCELED
+  invoiceId      String?     @unique
+  status         OrderStatus @default(PENDING)
   grossWei       String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  roleGrants RoleGrant[]
+
+  // ⬇️ add this line
+  webhookEvents WebhookEvent[]
+
+  @@index([status, updatedAt])
+  @@index([invoiceId])
+}
+
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  createdAt  DateTime @default(now())
+  deliveryId String   @unique
+  type       String
+  invoiceId  String?
+  orderId    String?
+  raw        Json
+
+  // This side already exists
+  order Order? @relation(fields: [orderId], references: [id])
+
+  @@index([invoiceId])
+  @@index([type, createdAt])
+}
+
+model RoleGrant {
+  id        String          @id @default(cuid())
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  orderId   String
+  productId String
+  discordId String
+  status    RoleGrantStatus @default(QUEUED)
+  attempts  Int             @default(0)
+  lastError String?
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([status, updatedAt])
+  @@index([discordId])
 }
