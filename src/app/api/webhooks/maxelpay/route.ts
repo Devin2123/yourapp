@@ -1,136 +1,175 @@
-// app/api/webhooks/maxelpay/route.ts
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
-import crypto from "crypto";
 import { prisma } from "@/lib/db";
+import crypto from "crypto";
 
-const MAXEL_SECRET = process.env.MAXELPAY_API_SECRET || "";
-const PLATFORM_FEE_BPS = Number(process.env.PLATFORM_FEE_BPS ?? "300"); // 3% default
+const MOCK = process.env.MAXELPAY_MOCK === "true";
+const SECRET = process.env.MAXELPAY_API_SECRET || "";
+const FEE_BPS = Number(process.env.PLATFORM_FEE_BPS ?? 300); // 3%
 
-function safeEqual(a: string, b: string) {
-  const A = Buffer.from(a);
-  const B = Buffer.from(b);
-  return A.length === B.length && crypto.timingSafeEqual(A, B);
+type PaidEvent = {
+  event_id?: string;
+  id?: string;
+  type?: string;
+  data?: {
+    invoice_id?: string | null;
+    amount_minor?: string | null;
+    asset?: string | null;
+    chain?: string | null;
+    metadata?: { order_id?: string | null } | null;
+  };
+};
+
+function bad(msg: string, code = 400) {
+  return NextResponse.json({ error: msg }, { status: code });
 }
 
-// Example HMAC verifier; swap to MaxelPay's exact header names/scheme.
-function verify(req: NextRequest, raw: string) {
-  // e.g., X-MX-Signature, X-MX-Timestamp
-  const sig = req.headers.get("x-mx-signature") || "";
-  const ts = req.headers.get("x-mx-timestamp") || "";
-  if (!sig || !ts || !MAXEL_SECRET) return false;
-  const mac = crypto.createHmac("sha256", MAXEL_SECRET).update(`${ts}.${raw}`).digest("hex");
-  return safeEqual(sig, mac);
+function verifySignature(ts: string | null, sig: string | null, raw: string) {
+  if (MOCK) return true;
+  if (!ts || !sig || !SECRET) return false;
+  const h = crypto.createHmac("sha256", SECRET).update(`${ts}.${raw}`).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(h), Buffer.from(sig));
+  } catch {
+    return false;
+  }
 }
 
 export async function POST(req: NextRequest) {
+  // read raw for HMAC
+  const raw = await req.text();
+
+  let evt: PaidEvent;
   try {
-    const raw = await req.text();
+    evt = JSON.parse(raw) as PaidEvent;
+  } catch {
+    return bad("invalid json");
+  }
 
-    // Allow bypass while testing
-    const mock = process.env.MAXELPAY_MOCK === "true";
-    if (!mock && !verify(req, raw)) {
-      return NextResponse.json({ error: "bad signature" }, { status: 400 });
-    }
+  // verify signature unless mock mode
+  const ok = verifySignature(
+    req.headers.get("x-mx-timestamp"),
+    req.headers.get("x-mx-signature"),
+    raw
+  );
+  if (!ok) return bad("bad signature", 401);
 
-    const evt = JSON.parse(raw) as {
-      event_id?: string;
-      type: string;
+  const deliveryId = String(evt.event_id ?? evt.id ?? "");
+  const type = String(evt.type ?? "");
+
+  // idempotency (deliveryId is unique)
+  try {
+    await prisma.webhookEvent.create({
       data: {
-        invoice_id: string;
-        amount_minor?: string; // smallest units
-        asset?: string;        // "USDC" | "NATIVE"
-        chain?: string;        // "POLYGON"
-        metadata?: any;
-        status?: string;
-        tx_hash?: string;
-      };
-    };
+        deliveryId,
+        type,
+        raw: evt as unknown as object,
+        invoiceId: evt?.data?.invoice_id ?? null,
+      },
+    });
+  } catch {
+    return NextResponse.json({ ok: true, duplicate: true });
+  }
 
-    // Persist the raw event for idempotency/forensics
-    if (evt.event_id) {
-      try {
-        await prisma.webhookEvent.create({
-          data: {
-            deliveryId: evt.event_id,
-            type: evt.type,
-            invoiceId: evt.data?.invoice_id ?? null,
-            orderId: evt.data?.metadata?.order_id ?? null,
-            raw: evt as any,
-          },
-        });
-      } catch {
-        // duplicate delivery id -> idempotent ack
-        return NextResponse.json({ ok: true });
-      }
+  if (type === "invoice.paid") {
+    const inv = evt?.data?.invoice_id ?? undefined;
+    const metaOrderId = evt?.data?.metadata?.order_id ?? undefined;
+
+    // 1) try metadata.order_id, 2) fall back to invoice_id
+    const order =
+      (metaOrderId
+        ? await prisma.order.findUnique({
+            where: { id: metaOrderId },
+            include: { product: { include: { server: true } } },
+          })
+        : null) ||
+      (inv
+        ? await prisma.order.findFirst({
+            where: { invoiceId: inv },
+            include: { product: { include: { server: true } } },
+          })
+        : null);
+
+    if (!order) {
+      return NextResponse.json({ ok: true, note: "order not found" });
     }
 
-    if (evt.type === "invoice.paid") {
-      const inv = evt.data.invoice_id;
-      const order = await prisma.order.findFirst({
-        where: { invoiceId: inv },
-        include: { product: { include: { server: true } } },
-      });
+    // amounts (minor units)
+    const grossMinorStr = String(evt?.data?.amount_minor ?? "0");
+    const gross = BigInt(grossMinorStr);
+    const fee = (gross * BigInt(FEE_BPS)) / BigInt(10_000);
+    const net = gross - fee;
 
-      if (!order) {
-        // Unknown invoice: ack to avoid retries
-        return NextResponse.json({ ok: true, note: "order not found" });
-      }
-
-      // Mark paid (idempotent)
-      if (order.status !== "PAID") {
-        await prisma.order.update({ where: { id: order.id }, data: { status: "PAID" } });
-      }
-
-      // Amounts (smallest unit strings)
-      // Prefer webhook's amount_minor; fallback to product.priceWei (works for native) if needed.
-      const gross = BigInt(evt.data.amount_minor ?? order.grossMinor ?? order.grossWei ?? "0");
-      const fee = (gross * BigInt(PLATFORM_FEE_BPS)) / BigInt(10_000);
-      const net = gross - fee;
-
-      await prisma.order.update({
+    await prisma.$transaction(async (tx) => {
+      // flip to PAID
+      await tx.order.update({
         where: { id: order.id },
         data: {
+          status: "PAID",
           grossMinor: gross.toString(),
           feeMinor: fee.toString(),
           netMinor: net.toString(),
         },
       });
 
-      // Enqueue one payout of 97% to the seller's address
-      const server = order.product.server;
-      const sellerAddress = server.payoutWallet;
-      if (sellerAddress && net > 0n) {
-        await prisma.payout.create({
-          data: {
-            serverId: server.id,
-            orderId: order.id,
-            amountMinor: net.toString(),
-            asset: evt.data.asset ?? order.product.currency, // e.g. "USDC" or "NATIVE"
-            chain: evt.data.chain ?? server.chain,           // e.g. "POLYGON"
-            toAddress: sellerAddress,
-            status: "QUEUED",
-          },
-        });
+      // enqueue payout (97%) if seller wallet exists
+      const seller = order.product.server.payoutWallet;
+      if (seller) {
+        const exists = await tx.payout.findFirst({ where: { orderId: order.id } });
+        if (!exists) {
+          await tx.payout.create({
+            data: {
+              orderId: order.id,
+              serverId: order.product.serverId,
+              toAddress: seller,
+              asset: order.product.currency,
+              chain: order.product.chain ?? "POLYGON",
+              amountMinor: net.toString(),
+              status: "QUEUED",
+            },
+          });
+        }
       }
 
-      return NextResponse.json({ ok: true });
-    }
+      // enqueue Discord role grant
+      if (order.buyerDiscordId && order.product.roleId) {
+        const already = await tx.roleGrant.findFirst({
+          where: { orderId: order.id, discordId: order.buyerDiscordId },
+        });
+        if (!already) {
+          await tx.roleGrant.create({
+            data: {
+              orderId: order.id,
+              productId: order.productId,
+              discordId: order.buyerDiscordId,
+              status: "QUEUED",
+            },
+          });
+        }
+      }
 
-    // (Optional) handle expired/failed to mark orders
-    if (evt.type === "invoice.expired") {
-      const inv = evt.data.invoice_id;
-      await prisma.order.updateMany({
-        where: { invoiceId: inv, status: "PENDING" },
-        data: { status: "EXPIRED" },
+      // backfill WebhookEvent with orderId
+      await tx.webhookEvent.update({
+        where: { deliveryId },
+        data: { orderId: order.id, invoiceId: inv ?? order.invoiceId ?? null },
       });
-      return NextResponse.json({ ok: true });
-    }
+    });
 
     return NextResponse.json({ ok: true });
-  } catch (e: any) {
-    console.error("MaxelPay webhook error:", e);
-    return NextResponse.json({ error: "internal" }, { status: 500 });
   }
+
+  if (type === "invoice.expired" || type === "invoice.canceled") {
+    const inv = evt?.data?.invoice_id ?? undefined;
+    if (inv) {
+      await prisma.order.updateMany({
+        where: { invoiceId: inv, status: { in: ["PENDING"] } },
+        data: { status: type === "invoice.expired" ? "EXPIRED" : "CANCELED" },
+      });
+    }
+    return NextResponse.json({ ok: true });
+  }
+
+  return NextResponse.json({ ok: true, ignored: type });
 }

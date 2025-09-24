@@ -32,25 +32,33 @@ export async function POST(req: NextRequest) {
     const appUrl = process.env.NEXT_PUBLIC_APP_URL!;
     const invoice = await createInvoice({
       orderId: order.id,
-      amount: "10",              // TODO: replace with your real pricing
+      amount: "10",
       currency: "USD",
       userName: username,
       userEmail: email,
-      siteName: "YourBrand",     // your brand name here
+      siteName: "YourBrand",
       redirectUrl: `${appUrl}/success?order=${order.id}`,
       cancelUrl: `${appUrl}/products/${product.id}?canceled=1`,
       websiteUrl: appUrl,
-      webhookUrl: process.env.MAXELPAY_WEBHOOK_URL || `${appUrl}/api/webhooks/maxelpay`,
-    });
+      webhookUrl:
+        process.env.MAXELPAY_WEBHOOK_URL || `${appUrl}/api/webhooks/maxelpay`,
+      // 👇 helps the webhook find the order even if invoice_id differs
+      // (Make sure CreateInvoiceInput has `metadata?: Record<string,string>`.)
+      metadata: { order_id: order.id, product_id: product.id },
+    } as any); // keep `as any` if your lib type doesn't have `metadata` yet
 
     await prisma.order.update({
       where: { id: order.id },
       data: { invoiceId: invoice.invoiceId },
     });
 
-    return NextResponse.json({ orderId: order.id, checkoutUrl: invoice.checkoutUrl });
-  } catch (err: any) {
-    console.error("Create invoice error:", err?.message || err);
-    return NextResponse.json({ error: err?.message || "Internal error" }, { status: 500 });
+    return NextResponse.json({
+      orderId: order.id,
+      checkoutUrl: invoice.checkoutUrl,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Internal error";
+    console.error("Create invoice error:", msg);
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

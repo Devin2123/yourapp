@@ -7,13 +7,16 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-	"build:scripts": "tsc -p tsconfig.scripts.json",
+    "build:scripts": "tsc -p tsconfig.scripts.json",
     "register:cmds": "node dist-scripts/scripts/register-commands.js",
     "bot": "node dist-scripts/src/bot/index.js",
     "role-worker": "node dist-scripts/scripts/role-worker.js",
-	"build:scripts": "tsc -p tsconfig.scripts.json",
+    "dev:stg": "dotenv -e .env.stg -- next dev",
+    "register:cmds:stg": "dotenv -e .env.stg -- node dist-scripts/scripts/register-commands.js",
+    "bot:stg": "dotenv -e .env.stg -- node dist-scripts/src/bot/index.js",
+    "role-worker:stg": "dotenv -e .env.stg -- node dist-scripts/scripts/role-worker.js",
+    "payout-worker:stg": "dotenv -e .env.stg -- node dist-scripts/scripts/payout-worker.js",
     "payout-worker": "node dist-scripts/scripts/payout-worker.js"
-
   },
   "dependencies": {
     "@prisma/client": "^6.16.2",
@@ -26,10 +29,12 @@
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
+    "@types/crypto-js": "^4.2.2",
     "@types/node": "^20.19.17",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "autoprefixer": "^10.4.21",
+    "dotenv-cli": "^10.0.0",
     "eslint": "^9",
     "eslint-config-next": "15.5.3",
     "postcss": "^8.5.6",

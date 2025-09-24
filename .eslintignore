@@ -1,0 +1,5 @@
+.next
+node_modules
+dist-scripts
+src/generated/**
+src/generated/prisma/**

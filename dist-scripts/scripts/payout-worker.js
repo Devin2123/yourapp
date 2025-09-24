@@ -6,31 +6,96 @@ const client_1 = require("@prisma/client");
 const prisma = new client_1.PrismaClient();
 const API_URL = process.env.MAXELPAY_API_BASE;
 const API_KEY = process.env.MAXELPAY_API_KEY;
+const MOCK = process.env.MAXELPAY_MOCK === "true";
+function log(...args) {
+    console.log(new Date().toISOString(), ...args);
+}
 async function requestPayout(p) {
-    // TODO: swap field names to MaxelPay's real payout API schema
-    const body = {
-        amount_minor: p.amountMinor,
-        asset: p.asset, // "USDC" | "NATIVE"
-        chain: p.chain, // "POLYGON"
-        to: p.toAddress, // seller address
-        idempotency_key: p.id,
-        metadata: { orderId: p.orderId, serverId: p.serverId },
+    if (MOCK) {
+        // In mock mode we pretend provider accepted & confirmed immediately
+        return { id: `mock_${p.id}`, tx_hash: `0xmock${p.id.slice(0, 8)}`, status: "confirmed" };
+    }
+    // --- Amount/chain helpers ---
+    const DECIMALS = { USDC: 6, USDT: 6, USDCe: 6, NATIVE: 18, MATIC: 18, ETH: 18 };
+    const toDecimal = (minor, asset) => {
+        var _a;
+        const d = (_a = DECIMALS[asset]) !== null && _a !== void 0 ? _a : 18;
+        const s = (minor || "").replace(/^0+/, "") || "0";
+        if (s === "0")
+            return "0";
+        const pad = s.padStart(d + 1, "0");
+        const head = pad.slice(0, -d);
+        const tail = pad.slice(-d).replace(/0+$/, "");
+        return tail ? `${head}.${tail}` : head;
     };
+    const chainToNetwork = (c) => {
+        const x = (c || "").toUpperCase();
+        if (x === "POLYGON" || x === "MATIC")
+            return "polygon";
+        if (x === "ETHEREUM" || x === "ETH")
+            return "ethereum";
+        if (x === "BASE")
+            return "base";
+        return x.toLowerCase();
+    };
+    // --- Env-driven shape so you can iterate without code edits ---
+    const FORMAT = (process.env.MAXELPAY_PAYOUT_FORMAT || "A").toUpperCase(); // A | B | C (C includes currency+asset)
+    const DEST_KEY = process.env.MAXELPAY_PAYOUT_DEST_KEY || "destination_address"; // "destination_address" | "to_address" | "to" | "recipient"
+    const NET_KEY = process.env.MAXELPAY_PAYOUT_NETWORK_KEY || "network"; // "network" | "chain" | "chain_id"
+    const AMT_KEY = process.env.MAXELPAY_PAYOUT_AMOUNT_KEY || "amount"; // "amount" (decimal) | "amount_minor"
+    const NUMERIC = process.env.MAXELPAY_PAYOUT_NUMERIC === "true"; // send numbers instead of strings?
+    const base = {
+        amount: toDecimal(p.amountMinor, p.asset), // decimal string
+        amount_minor: p.amountMinor, // minor units string
+        currency: p.asset, // symbol
+        asset: p.asset,
+        network: chainToNetwork(p.chain),
+        chain: p.chain,
+        chain_id: p.chain === "POLYGON" ? 137 : p.chain === "ETHEREUM" ? 1 : undefined,
+        to: p.toAddress,
+        to_address: p.toAddress,
+        destination_address: p.toAddress,
+        recipient: p.toAddress,
+        idempotency_key: p.id,
+        metadata: { payout_id: p.id, order_id: p.orderId, server_id: p.serverId },
+    };
+    const amountValue = AMT_KEY === "amount"
+        ? (NUMERIC ? Number(base.amount) : String(base.amount))
+        : (NUMERIC ? Number(base.amount_minor) : String(base.amount_minor));
+    const payload = {
+        idempotency_key: base.idempotency_key,
+        metadata: base.metadata,
+    };
+    payload[AMT_KEY] = amountValue;
+    payload[NET_KEY] = base[NET_KEY];
+    payload[DEST_KEY] = base[DEST_KEY];
+    if (FORMAT === "C") {
+        payload.currency = base.currency;
+        payload.asset = base.asset;
+    }
     const res = await fetch(`${API_URL}/v1/payouts`, {
         method: "POST",
         headers: {
             Authorization: `Bearer ${API_KEY}`,
             "Content-Type": "application/json",
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
     });
+    const text = await res.text().catch(() => "");
     if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`payout req failed: ${res.status} ${txt}`);
+        const reason = `payout req failed: ${res.status} ${text.slice(0, 800)} :: sent=${JSON.stringify(payload).slice(0, 800)}`;
+        throw new Error(reason);
     }
-    return (await res.json());
+    try {
+        return JSON.parse(text);
+    }
+    catch (_a) {
+        return { status: "unknown" };
+    }
 }
 async function pollPayout(externalId) {
+    if (MOCK)
+        return { status: "confirmed", tx_hash: `0xmock_${externalId}` };
     const res = await fetch(`${API_URL}/v1/payouts/${externalId}`, {
         headers: { Authorization: `Bearer ${API_KEY}` },
     });
@@ -39,12 +104,17 @@ async function pollPayout(externalId) {
     return (await res.json());
 }
 async function processBatch(limit = 25) {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d, _e, _f;
     const rows = await prisma.payout.findMany({
         where: { status: { in: ["QUEUED", "REQUESTED"] } },
         orderBy: { createdAt: "asc" },
         take: limit,
     });
+    if (!rows.length) {
+        log("no payouts to process");
+        return;
+    }
+    log(`processing ${rows.length} payout(s)…`);
     for (const p of rows) {
         try {
             if (p.status === "QUEUED") {
@@ -57,33 +127,43 @@ async function processBatch(limit = 25) {
                     orderId: p.orderId,
                     serverId: p.serverId,
                 });
+                // In MOCK: mark CONFIRMED immediately. Otherwise: REQUESTED to start polling.
                 await prisma.payout.update({
                     where: { id: p.id },
                     data: {
-                        status: "REQUESTED",
+                        status: MOCK ? "CONFIRMED" : "REQUESTED",
                         externalId: (_a = data.id) !== null && _a !== void 0 ? _a : null,
                         txHash: (_b = data.tx_hash) !== null && _b !== void 0 ? _b : null,
                         attempts: { increment: 1 },
                         lastError: null,
                     },
                 });
+                if (MOCK)
+                    log(`✅ MOCK payout confirmed → ${p.toAddress} amountMinor=${p.amountMinor} ${p.asset}`);
+                else
+                    log(`requested payout ${p.id} ext=${(_c = data.id) !== null && _c !== void 0 ? _c : "?"}`);
             }
-            else if (p.status === "REQUESTED" && p.externalId) {
+            if (!MOCK && p.status === "REQUESTED" && p.externalId) {
                 const s = await pollPayout(p.externalId);
                 if (s.status === "sent" || s.status === "broadcasted") {
                     await prisma.payout.update({
                         where: { id: p.id },
-                        data: { status: "SENT", txHash: (_c = s.tx_hash) !== null && _c !== void 0 ? _c : p.txHash },
+                        data: { status: "SENT", txHash: (_d = s.tx_hash) !== null && _d !== void 0 ? _d : p.txHash },
                     });
+                    log(`payout ${p.id} sent`);
                 }
                 else if (s.status === "confirmed") {
                     await prisma.payout.update({
                         where: { id: p.id },
-                        data: { status: "CONFIRMED", txHash: (_d = s.tx_hash) !== null && _d !== void 0 ? _d : p.txHash },
+                        data: { status: "CONFIRMED", txHash: (_e = s.tx_hash) !== null && _e !== void 0 ? _e : p.txHash },
                     });
+                    log(`✅ payout ${p.id} confirmed`);
                 }
                 else if (s.status === "failed") {
                     throw new Error("provider marked payout failed");
+                }
+                else {
+                    log(`payout ${p.id} status=${s.status}`);
                 }
             }
         }
@@ -94,18 +174,20 @@ async function processBatch(limit = 25) {
                 data: {
                     status: attempts >= 5 ? "FAILED" : p.status,
                     attempts: { increment: 1 },
-                    lastError: String((_e = e === null || e === void 0 ? void 0 : e.message) !== null && _e !== void 0 ? _e : e),
+                    lastError: String((_f = e === null || e === void 0 ? void 0 : e.message) !== null && _f !== void 0 ? _f : e),
                 },
             });
-            console.error("payout error:", p.id, (e === null || e === void 0 ? void 0 : e.message) || e);
+            console.error("❌ payout error:", p.id, (e === null || e === void 0 ? void 0 : e.message) || e);
         }
     }
 }
 async function main() {
-    console.log("Payout worker started");
+    log("Payout worker started (MOCK:", MOCK, ")");
+    // run immediately so you see results, then every 5s
+    await processBatch();
     setInterval(() => {
         processBatch().catch(err => console.error("payout tick error:", err));
-    }, 20000);
+    }, 5000);
 }
 main().catch(e => {
     console.error(e);
