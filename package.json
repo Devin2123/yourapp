@@ -10,7 +10,9 @@
 	"build:scripts": "tsc -p tsconfig.scripts.json",
     "register:cmds": "node dist-scripts/scripts/register-commands.js",
     "bot": "node dist-scripts/src/bot/index.js",
-    "role-worker": "node dist-scripts/scripts/role-worker.js"
+    "role-worker": "node dist-scripts/scripts/role-worker.js",
+	"build:scripts": "tsc -p tsconfig.scripts.json",
+    "payout-worker": "node dist-scripts/scripts/payout-worker.js"
 
   },
   "dependencies": {
