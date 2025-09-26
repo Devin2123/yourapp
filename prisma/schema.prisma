@@ -31,32 +31,61 @@ enum PayoutStatus {
   FAILED
 }
 
+// --- Server ---
 model Server {
-  id              String    @id @default(cuid())
-  guildId         String    @unique
+  id              String   @id @default(cuid())
+  guildId         String   @unique
   ownerDiscordId  String
   payoutWallet    String
-  chain           String    @default("POLYGON")
-  splitterAddress String
-  createdAt       DateTime  @default(now())
-  products        Product[]
-  payouts         Payout[]
+  chain           String   @default("POLYGON")
+  splitterAddress String?
+  createdAt       DateTime @default(now())
+
+  products Product[]
+  // roleGrants RoleGrant[]      // ❌ remove this line
+  wallets  Wallet[] // ✅ keep (new)
+  payouts  Payout[] // ✅ add this line
+
+  @@index([guildId])
+}
+
+// --- Wallet (for seller’s per-currency addresses) ---
+model Wallet {
+  id        String    @id @default(cuid())
+  serverId  String
+  server    Server    @relation(fields: [serverId], references: [id])
+  currency  String // e.g. "BTC" | "ETH" | "USDT" | "DOGE"
+  address   String
+  createdAt DateTime  @default(now())
+  Product   Product[]
+
+  @@unique([serverId, currency])
+  @@index([serverId])
 }
 
 model Product {
-  id          String   @id @default(cuid())
-  serverId    String
-  server      Server   @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  id       String @id @default(cuid())
+  serverId String
+  server   Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  // 👇 NEW: bind a product to a specific payout wallet
+  walletId String?
+  wallet   Wallet? @relation(fields: [walletId], references: [id])
+
   name        String
   description String?
-  priceWei    String
-  currency    String
-  chain       String   @default("POLYGON")
-  roleId      String?
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  orders      Order[]
-  roleGrants  RoleGrant[]
+  // price in USD cents (seller sets this)
+  priceMinor  Int
+  // informative copies (kept for convenience / querying)
+  currency    String // should mirror wallet.asset
+  chain       String  @default("POLYGON") // should mirror wallet.chain
+
+  roleId    String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  orders     Order[]
+  roleGrants RoleGrant[]
 
   @@index([serverId])
   @@index([active, createdAt])
@@ -71,19 +100,19 @@ model Order {
   status         OrderStatus @default(PENDING)
 
   // existing (native amounts)
-  grossWei       String?
+  grossWei String?
 
   // optional split breakdown in "minor units" (e.g., USDC 6dp or wei for native)
-  grossMinor     String?
-  feeMinor       String?
-  netMinor       String?
+  grossMinor String?
+  feeMinor   String?
+  netMinor   String?
 
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  roleGrants     RoleGrant[]
-  webhookEvents  WebhookEvent[]
-  payouts        Payout[]
+  roleGrants    RoleGrant[]
+  webhookEvents WebhookEvent[]
+  payouts       Payout[]
 
   @@index([status, updatedAt])
   @@index([invoiceId])
@@ -98,7 +127,7 @@ model WebhookEvent {
   orderId    String?
   raw        Json
 
-  order      Order?   @relation(fields: [orderId], references: [id])
+  order Order? @relation(fields: [orderId], references: [id])
 
   @@index([invoiceId])
   @@index([type, createdAt])
@@ -122,28 +151,24 @@ model RoleGrant {
   @@index([discordId])
 }
 
+// --- Payout (just rename relation field & add backref) ---
 model Payout {
-  id          String        @id @default(cuid())
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
-
+  id          String   @id @default(cuid())
+  orderId     String   @unique
   serverId    String
-  Server      Server        @relation(fields: [serverId], references: [id])
-
-  orderId     String?
-  Order       Order?        @relation(fields: [orderId], references: [id])
-
-  amountMinor String        // smallest units (e.g., USDC 6dp, or wei for native)
-  asset       String        // "USDC" | "NATIVE" | "USDT" etc.
-  chain       String        // "POLYGON" | "ETHEREUM" etc.
-  toAddress   String        // seller payout address
-
-  externalId  String?       // provider payout id
-  txHash      String?
-
-  status      PayoutStatus  @default(QUEUED)
-  attempts    Int           @default(0)
+  toAddress   String
+  asset       String
+  chain       String
+  amountMinor String
+  status      String   // or your enum
+  attempts    Int      @default(0)
   lastError   String?
+  txHash      String?  // you already reference this
+  externalId  String?  // 👈 add this
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  @@index([status, createdAt])
+  // relations...
+  Server Server @relation(fields: [serverId], references: [id])
+  Order  Order  @relation(fields: [orderId], references: [id])
 }

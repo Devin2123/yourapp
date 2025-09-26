@@ -16,8 +16,8 @@ type PaidEvent = {
   data?: {
     invoice_id?: string | null;
     amount_minor?: string | null;
-    asset?: string | null;
-    chain?: string | null;
+    asset?: string | null;   // from provider, if present
+    chain?: string | null;   // from provider, if present
     metadata?: { order_id?: string | null } | null;
   };
 };
@@ -82,13 +82,13 @@ export async function POST(req: NextRequest) {
       (metaOrderId
         ? await prisma.order.findUnique({
             where: { id: metaOrderId },
-            include: { product: { include: { server: true } } },
+            include: { product: { include: { server: true, wallet: true } } }, // 👈 include wallet
           })
         : null) ||
       (inv
         ? await prisma.order.findFirst({
             where: { invoiceId: inv },
-            include: { product: { include: { server: true } } },
+            include: { product: { include: { server: true, wallet: true } } }, // 👈 include wallet
           })
         : null);
 
@@ -114,18 +114,32 @@ export async function POST(req: NextRequest) {
         },
       });
 
-      // enqueue payout (97%) if seller wallet exists
-      const seller = order.product.server.payoutWallet;
-      if (seller) {
+      // Prefer the product's bound wallet; otherwise fall back to server.payoutWallet
+      const prodWallet = order.product.wallet; // type: { id, createdAt, serverId, currency, address } | null
+      const serverWallet = order.product.server.payoutWallet || null;
+
+      // What we pay out TO:
+      const toAddress = prodWallet?.address || serverWallet;
+
+      // What *asset/currency* we record for payout:
+      // Your Wallet model uses `currency` (not `asset`), so use that.
+      const payoutAsset = prodWallet?.currency || order.product.currency;
+
+      // What *chain* we record for payout:
+      // If your Wallet model doesn't store chain, keep product.chain (or event chain if you prefer).
+      const payoutChain = order.product.chain || evt?.data?.chain || "POLYGON";
+
+      // Only enqueue if we have a destination
+      if (toAddress) {
         const exists = await tx.payout.findFirst({ where: { orderId: order.id } });
         if (!exists) {
           await tx.payout.create({
             data: {
               orderId: order.id,
               serverId: order.product.serverId,
-              toAddress: seller,
-              asset: order.product.currency,
-              chain: order.product.chain ?? "POLYGON",
+              toAddress,
+              asset: payoutAsset,                // e.g. 'BTC' | 'ETH' | 'USDT' | 'DOGE' | 'USD'
+              chain: payoutChain,                // e.g. 'BTC' | 'ETH' | 'DOGE' | 'POLYGON'
               amountMinor: net.toString(),
               status: "QUEUED",
             },

@@ -1,3 +1,4 @@
+// src/app/api/invoices/route.ts
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
@@ -17,6 +18,7 @@ export async function POST(req: NextRequest) {
     const json = await req.json();
     const { productId, buyerDiscordId, email, username } = Body.parse(json);
 
+    // Load product (and its server for later flows)
     const product = await prisma.product.findUnique({
       where: { id: productId },
       include: { server: true },
@@ -25,14 +27,24 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Product not found" }, { status: 404 });
     }
 
+    // Require seller-set price in cents (USD)
+    const cents = Number(product.priceMinor);
+    if (!Number.isFinite(cents) || cents <= 0) {
+      return NextResponse.json({ error: "Product is missing a valid price" }, { status: 400 });
+    }
+    // Convert to "12.99" style string for MaxelPay
+    const amountUsd = (cents / 100).toFixed(2);
+
+    // Create order first (PENDING)
     const order = await prisma.order.create({
       data: { productId, buyerDiscordId },
     });
 
     const appUrl = process.env.NEXT_PUBLIC_APP_URL!;
+    // Create the MaxelPay invoice
     const invoice = await createInvoice({
       orderId: order.id,
-      amount: "10",
+      amount: amountUsd,           // ← seller-controlled USD price
       currency: "USD",
       userName: username,
       userEmail: email,
@@ -40,13 +52,14 @@ export async function POST(req: NextRequest) {
       redirectUrl: `${appUrl}/success?order=${order.id}`,
       cancelUrl: `${appUrl}/products/${product.id}?canceled=1`,
       websiteUrl: appUrl,
-      webhookUrl:
-        process.env.MAXELPAY_WEBHOOK_URL || `${appUrl}/api/webhooks/maxelpay`,
-      // 👇 helps the webhook find the order even if invoice_id differs
-      // (Make sure CreateInvoiceInput has `metadata?: Record<string,string>`.)
+      webhookUrl: process.env.MAXELPAY_WEBHOOK_URL || `${appUrl}/api/webhooks/maxelpay`,
+      // Helps the webhook find the order even if invoice_id differs
+      // If your CreateInvoiceInput doesn't include `metadata` yet,
+      // either add it there or keep this file's call typed as `any`.
       metadata: { order_id: order.id, product_id: product.id },
-    } as any); // keep `as any` if your lib type doesn't have `metadata` yet
+    } as any);
 
+    // Persist invoice id back on the order
     await prisma.order.update({
       where: { id: order.id },
       data: { invoiceId: invoice.invoiceId },
